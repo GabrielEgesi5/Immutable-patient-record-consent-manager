@@ -10,9 +10,12 @@
 (define-constant ERR_INVALID_INPUT (err u103))
 (define-constant ERR_CONSENT_EXPIRED (err u104))
 (define-constant ERR_CONSENT_REVOKED (err u105))
+(define-constant ERR_EMERGENCY_FORBIDDEN (err u106))
+(define-constant MAX_EMERGENCY_WINDOW u720)
 
 (define-data-var next-record-id uint u1)
 (define-data-var next-consent-id uint u1)
+(define-data-var next-emergency-id uint u1)
 
 (define-map patients
     principal
@@ -69,6 +72,18 @@
 (define-map record-owners
     uint
     principal
+)
+
+(define-map emergency-access
+    uint
+    {
+        patient: principal,
+        provider: principal,
+        reason: (string-ascii 80),
+        granted-at: uint,
+        expires-at: uint,
+        acknowledged: bool
+    }
 )
 
 (define-public (register-patient (name (string-ascii 50)))
@@ -226,13 +241,112 @@
     )
 )
 
+(define-public (request-emergency-access (patient principal) (reason (string-ascii 80)) (duration uint))
+    (let
+        (
+            (emergency-id (var-get next-emergency-id))
+        )
+        (asserts! (is-some (map-get? patients patient)) ERR_NOT_FOUND)
+        (asserts! (is-some (map-get? healthcare-providers tx-sender)) ERR_UNAUTHORIZED)
+        
+        (unwrap! (match (map-get? healthcare-providers tx-sender)
+            provider-data
+            (begin
+                (asserts! (get verified provider-data) ERR_UNAUTHORIZED)
+                (ok true)
+            )
+            ERR_UNAUTHORIZED
+        ) ERR_UNAUTHORIZED)
+        
+        (asserts! (> duration u0) ERR_INVALID_INPUT)
+        (asserts! (<= duration MAX_EMERGENCY_WINDOW) ERR_INVALID_INPUT)
+        (asserts! (>= (len reason) u5) ERR_INVALID_INPUT)
+        
+        (map-set emergency-access emergency-id {
+            patient: patient,
+            provider: tx-sender,
+            reason: reason,
+            granted-at: stacks-block-height,
+            expires-at: (+ stacks-block-height duration),
+            acknowledged: false
+        })
+        
+        (var-set next-emergency-id (+ emergency-id u1))
+        (ok emergency-id)
+    )
+)
+
+(define-public (acknowledge-emergency (emergency-id uint) (accept bool))
+    (match (map-get? emergency-access emergency-id)
+        emergency-data
+        (begin
+            (asserts! (is-eq (get patient emergency-data) tx-sender) ERR_UNAUTHORIZED)
+            (asserts! (> stacks-block-height (get expires-at emergency-data)) ERR_EMERGENCY_FORBIDDEN)
+            
+            (map-set emergency-access emergency-id (merge emergency-data {acknowledged: true}))
+            
+            (if (not accept)
+                (let
+                    (
+                        (provider (get provider emergency-data))
+                        (consent-key {patient: tx-sender, provider: provider})
+                    )
+                    (unwrap-panic (revoke-all-consents provider))
+                )
+                true
+            )
+            
+            (ok accept)
+        )
+        ERR_NOT_FOUND
+    )
+)
+
+(define-private (is-emergency-active (patient principal) (provider principal))
+    (get found (fold check-emergency-match (generate-emergency-ids) {patient: patient, provider: provider, found: false}))
+)
+
+(define-private (check-emergency-match (emergency-id uint) (data {patient: principal, provider: principal, found: bool}))
+    (if (get found data)
+        data
+        (match (map-get? emergency-access emergency-id)
+            emergency-data
+            (if (and
+                (is-eq (get patient data) (get patient emergency-data))
+                (is-eq (get provider data) (get provider emergency-data))
+                (< stacks-block-height (get expires-at emergency-data))
+                (not (get acknowledged emergency-data)))
+                (merge data {found: true})
+                data)
+            data
+        )
+    )
+)
+
+(define-private (generate-emergency-ids)
+    (let
+        (
+            (total-emergencies (var-get next-emergency-id))
+        )
+        (if (> total-emergencies u0)
+            (unwrap-panic (slice? (list 
+                u0 u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20 u21 u22 u23 u24 u25 u26 u27 u28 u29 u30 u31 u32 u33 u34 u35 u36 u37 u38 u39 u40 u41 u42 u43 u44 u45 u46 u47 u48 u49 u50 u51 u52 u53 u54 u55 u56 u57 u58 u59 u60 u61 u62 u63 u64 u65 u66 u67 u68 u69 u70 u71 u72 u73 u74 u75 u76 u77 u78 u79 u80 u81 u82 u83 u84 u85 u86 u87 u88 u89 u90 u91 u92 u93 u94 u95 u96 u97 u98 u99
+            ) u0 total-emergencies))
+            (list)
+        )
+    )
+)
+
 (define-read-only (has-access (patient principal) (provider principal) (record-type (optional (string-ascii 30))))
     (let
         (
             (consent-key {patient: patient, provider: provider})
             (consent-ids (default-to (list) (map-get? patient-consents consent-key)))
         )
-        (> (len (filter is-valid-consent consent-ids)) u0)
+        (or
+            (> (len (filter is-valid-consent consent-ids)) u0)
+            (is-emergency-active patient provider)
+        )
     )
 )
 
@@ -292,10 +406,43 @@
     (map-get? record-owners record-id)
 )
 
+(define-read-only (get-emergency-info (emergency-id uint))
+    (map-get? emergency-access emergency-id)
+)
+
+(define-read-only (get-patient-emergencies (patient principal))
+    (get ids (fold build-patient-emergency-list (generate-emergency-ids) {patient: patient, ids: (list)}))
+)
+
+(define-read-only (get-provider-emergencies (provider principal))
+    (get ids (fold build-provider-emergency-list (generate-emergency-ids) {provider: provider, ids: (list)}))
+)
+
+(define-private (build-patient-emergency-list (emergency-id uint) (data {patient: principal, ids: (list 100 uint)}))
+    (match (map-get? emergency-access emergency-id)
+        emergency-data
+        (if (is-eq (get patient data) (get patient emergency-data))
+            (merge data {ids: (unwrap-panic (as-max-len? (append (get ids data) emergency-id) u100))})
+            data)
+        data
+    )
+)
+
+(define-private (build-provider-emergency-list (emergency-id uint) (data {provider: principal, ids: (list 100 uint)}))
+    (match (map-get? emergency-access emergency-id)
+        emergency-data
+        (if (is-eq (get provider data) (get provider emergency-data))
+            (merge data {ids: (unwrap-panic (as-max-len? (append (get ids data) emergency-id) u100))})
+            data)
+        data
+    )
+)
+
 (define-read-only (get-contract-info)
     {
         next-record-id: (var-get next-record-id),
         next-consent-id: (var-get next-consent-id),
+        next-emergency-id: (var-get next-emergency-id),
         contract-owner: CONTRACT_OWNER
     }
 )

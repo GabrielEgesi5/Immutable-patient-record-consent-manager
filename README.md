@@ -14,7 +14,8 @@ IPRCM enables patients to have full control over their healthcare data by managi
 - ✅ **Granular Consent Management**: Grant/revoke access permissions per provider and record type
 - ⏰ **Time-based Consent**: Optional expiration dates for temporary access
 - 🔍 **Access Verification**: Real-time consent checking for providers
-- 📊 **Audit Trail**: Complete history of all consent changes
+- 🚨 **Emergency Access Override**: Break-glass access for critical medical situations
+- 📊 **Audit Trail**: Complete history of all consent changes and emergency accesses
 
 ## 🚀 Quick Start
 
@@ -80,6 +81,21 @@ clarinet check
 (contract-call? .IPRCM get-record-info u1)
 ```
 
+#### 4. Request Emergency Access 🚨
+```clarity
+;; For critical situations when patient cannot consent
+(contract-call? .IPRCM request-emergency-access 'SP1PATIENT123... "cardiac arrest - need medication history" u60)
+```
+
+### For Emergency Situations 🆘
+
+#### Post-Emergency Patient Review
+```clarity
+;; Patient can acknowledge emergency access after the fact
+(contract-call? .IPRCM acknowledge-emergency u1 true)  ;; Accept emergency access
+(contract-call? .IPRCM acknowledge-emergency u2 false) ;; Reject and revoke provider access
+```
+
 ### For Contract Owner 👑
 
 #### Verify Providers
@@ -100,6 +116,8 @@ clarinet check
 | `grant-consent` | Grant access permission | `provider: principal, record-type: optional string-ascii, expires-at: optional uint` |
 | `revoke-consent` | Revoke specific consent | `consent-id: uint` |
 | `revoke-all-consents` | Revoke all consents for provider | `provider: principal` |
+| `request-emergency-access` | Request emergency break-glass access | `patient: principal, reason: string-ascii, duration: uint` |
+| `acknowledge-emergency` | Patient acknowledges emergency access | `emergency-id: uint, accept: bool` |
 
 ### Read-Only Functions
 
@@ -111,14 +129,19 @@ clarinet check
 | `get-record-info` | Get record details | `record-info` |
 | `get-consent-info` | Get consent details | `consent-info` |
 | `is-consent-active` | Check if consent is currently active | `bool` |
+| `get-emergency-info` | Get emergency access details | `emergency-info` |
+| `get-patient-emergencies` | Get all emergency accesses for patient | `list of emergency-ids` |
+| `get-provider-emergencies` | Get all emergency accesses by provider | `list of emergency-ids` |
 
 ## 🛡️ Security Features
 
 - ✅ **Access Control**: Only patients can manage their own consents
-- ✅ **Provider Verification**: Only verified providers can receive consent
+- ✅ **Provider Verification**: Only verified providers can receive consent and emergency access
 - ✅ **Immutable Records**: All records and consent changes are permanent
 - ✅ **Time-based Access**: Support for temporary access permissions
 - ✅ **Granular Permissions**: Consent can be specific to record types
+- 🚨 **Emergency Safeguards**: Time-limited emergency access with mandatory justification
+- 📝 **Post-Emergency Accountability**: Patients can review and reject emergency accesses
 
 ## ⚠️ Error Codes
 
@@ -130,6 +153,7 @@ clarinet check
 | u103 | `ERR_INVALID_INPUT` | Invalid input parameters |
 | u104 | `ERR_CONSENT_EXPIRED` | Consent has expired |
 | u105 | `ERR_CONSENT_REVOKED` | Consent has been revoked |
+| u106 | `ERR_EMERGENCY_FORBIDDEN` | Emergency access action not allowed |
 
 ## 🧪 Testing
 
