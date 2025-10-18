@@ -11,11 +11,13 @@
 (define-constant ERR_CONSENT_EXPIRED (err u104))
 (define-constant ERR_CONSENT_REVOKED (err u105))
 (define-constant ERR_EMERGENCY_FORBIDDEN (err u106))
+(define-constant ERR_TEMPLATE_NOT_ACTIVE (err u107))
 (define-constant MAX_EMERGENCY_WINDOW u720)
 
 (define-data-var next-record-id uint u1)
 (define-data-var next-consent-id uint u1)
 (define-data-var next-emergency-id uint u1)
+(define-data-var next-template-id uint u1)
 
 (define-map patients
     principal
@@ -84,6 +86,24 @@
         expires-at: uint,
         acknowledged: bool
     }
+)
+
+(define-map consent-templates
+    uint
+    {
+        provider: principal,
+        name: (string-ascii 50),
+        description: (string-ascii 200),
+        record-types: (list 10 (string-ascii 30)),
+        default-duration: uint,
+        created-at: uint,
+        active: bool
+    }
+)
+
+(define-map provider-templates
+    principal
+    (list 50 uint)
 )
 
 (define-public (register-patient (name (string-ascii 50)))
@@ -302,6 +322,102 @@
     )
 )
 
+(define-public (create-consent-template (name (string-ascii 50)) (description (string-ascii 200)) (record-types (list 10 (string-ascii 30))) (default-duration uint))
+    (let
+        (
+            (template-id (var-get next-template-id))
+            (existing-templates (default-to (list) (map-get? provider-templates tx-sender)))
+        )
+        (asserts! (is-some (map-get? healthcare-providers tx-sender)) ERR_UNAUTHORIZED)
+        (asserts! (>= (len name) u1) ERR_INVALID_INPUT)
+        (asserts! (>= (len description) u10) ERR_INVALID_INPUT)
+        (asserts! (> (len record-types) u0) ERR_INVALID_INPUT)
+        (asserts! (> default-duration u0) ERR_INVALID_INPUT)
+        
+        (unwrap! (match (map-get? healthcare-providers tx-sender)
+            provider-data
+            (begin
+                (asserts! (get verified provider-data) ERR_UNAUTHORIZED)
+                (ok true)
+            )
+            ERR_NOT_FOUND
+        ) ERR_NOT_FOUND)
+        
+        (map-set consent-templates template-id {
+            provider: tx-sender,
+            name: name,
+            description: description,
+            record-types: record-types,
+            default-duration: default-duration,
+            created-at: stacks-block-height,
+            active: true
+        })
+        
+        (map-set provider-templates tx-sender (unwrap-panic (as-max-len? (append existing-templates template-id) u50)))
+        (var-set next-template-id (+ template-id u1))
+        
+        (ok template-id)
+    )
+)
+
+(define-public (use-consent-template (template-id uint) (custom-duration (optional uint)))
+    (match (map-get? consent-templates template-id)
+        template-data
+        (let
+            (
+                (provider (get provider template-data))
+                (duration (default-to (get default-duration template-data) custom-duration))
+                (expires-at (some (+ stacks-block-height duration)))
+            )
+            (asserts! (get active template-data) ERR_TEMPLATE_NOT_ACTIVE)
+            (asserts! (is-some (map-get? patients tx-sender)) ERR_UNAUTHORIZED)
+            
+            (fold grant-template-consent (get record-types template-data) {provider: provider, expires-at: expires-at, success: true})
+            (ok template-id)
+        )
+        ERR_NOT_FOUND
+    )
+)
+
+(define-private (grant-template-consent (record-type (string-ascii 30)) (data {provider: principal, expires-at: (optional uint), success: bool}))
+    (if (get success data)
+        (let
+            (
+                (consent-id (var-get next-consent-id))
+                (consent-key {patient: tx-sender, provider: (get provider data)})
+                (existing-consents (default-to (list) (map-get? patient-consents consent-key)))
+            )
+            (map-set consent-permissions consent-id {
+                patient: tx-sender,
+                provider: (get provider data),
+                record-type: (some record-type),
+                granted-at: stacks-block-height,
+                expires-at: (get expires-at data),
+                active: true
+            })
+            
+            (map-set patient-consents consent-key (unwrap-panic (as-max-len? (append existing-consents consent-id) u50)))
+            (var-set next-consent-id (+ consent-id u1))
+            
+            data
+        )
+        data
+    )
+)
+
+(define-public (deactivate-template (template-id uint))
+    (match (map-get? consent-templates template-id)
+        template-data
+        (begin
+            (asserts! (is-eq (get provider template-data) tx-sender) ERR_UNAUTHORIZED)
+            
+            (map-set consent-templates template-id (merge template-data {active: false}))
+            (ok true)
+        )
+        ERR_NOT_FOUND
+    )
+)
+
 (define-private (is-emergency-active (patient principal) (provider principal))
     (get found (fold check-emergency-match (generate-emergency-ids) {patient: patient, provider: provider, found: false}))
 )
@@ -438,11 +554,36 @@
     )
 )
 
+(define-read-only (get-template-info (template-id uint))
+    (map-get? consent-templates template-id)
+)
+
+(define-read-only (get-provider-templates (provider principal))
+    (map-get? provider-templates provider)
+)
+
+(define-read-only (get-active-templates (provider principal))
+    (let
+        (
+            (template-ids (default-to (list) (map-get? provider-templates provider)))
+        )
+        (filter is-template-active template-ids)
+    )
+)
+
+(define-private (is-template-active (template-id uint))
+    (match (map-get? consent-templates template-id)
+        template-data (get active template-data)
+        false
+    )
+)
+
 (define-read-only (get-contract-info)
     {
         next-record-id: (var-get next-record-id),
         next-consent-id: (var-get next-consent-id),
         next-emergency-id: (var-get next-emergency-id),
+        next-template-id: (var-get next-template-id),
         contract-owner: CONTRACT_OWNER
     }
 )
