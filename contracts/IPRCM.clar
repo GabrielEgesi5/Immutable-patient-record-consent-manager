@@ -578,6 +578,38 @@
     )
 )
 
+(define-private (build-expiring-consent-list (consent-id uint) (data {window: uint, now: uint, ids: (list 50 uint)}))
+    (match (map-get? consent-permissions consent-id)
+        consent-data
+        (let
+            (
+                (expires-at-opt (get expires-at consent-data))
+            )
+            (match expires-at-opt
+                expiry
+                (if (and
+                        (get active consent-data)
+                        (>= expiry (get now data))
+                        (<= expiry (+ (get now data) (get window data))))
+                    (merge data {ids: (unwrap-panic (as-max-len? (append (get ids data) consent-id) u50))})
+                    data)
+                data
+            )
+        )
+        data
+    )
+)
+
+(define-read-only (get-expiring-consents (patient principal) (provider principal) (window uint))
+    (let
+        (
+            (consent-key {patient: patient, provider: provider})
+            (consent-ids (default-to (list) (map-get? patient-consents consent-key)))
+        )
+        (get ids (fold build-expiring-consent-list consent-ids {window: window, now: stacks-block-height, ids: (list)}))
+    )
+)
+
 (define-read-only (get-contract-info)
     {
         next-record-id: (var-get next-record-id),
