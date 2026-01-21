@@ -12,6 +12,9 @@
 (define-constant ERR_CONSENT_REVOKED (err u105))
 (define-constant ERR_EMERGENCY_FORBIDDEN (err u106))
 (define-constant ERR_TEMPLATE_NOT_ACTIVE (err u107))
+(define-constant ERR_NOT_DELEGATE (err u108))
+(define-constant ERR_DELEGATE_EXISTS (err u109))
+(define-constant ERR_SELF_DELEGATION (err u110))
 (define-constant MAX_EMERGENCY_WINDOW u720)
 
 (define-data-var next-record-id uint u1)
@@ -104,6 +107,21 @@
 (define-map provider-templates
     principal
     (list 50 uint)
+)
+
+(define-map patient-delegates
+    {patient: principal, delegate: principal}
+    {
+        granted-at: uint,
+        can-grant: bool,
+        can-revoke: bool,
+        active: bool
+    }
+)
+
+(define-map delegate-patients
+    principal
+    (list 20 principal)
 )
 
 (define-public (register-patient (name (string-ascii 50)))
@@ -418,6 +436,142 @@
     )
 )
 
+(define-public (assign-delegate (delegate principal) (can-grant bool) (can-revoke bool))
+    (let
+        (
+            (delegate-key {patient: tx-sender, delegate: delegate})
+            (existing-patients (default-to (list) (map-get? delegate-patients delegate)))
+        )
+        (asserts! (is-some (map-get? patients tx-sender)) ERR_UNAUTHORIZED)
+        (asserts! (not (is-eq tx-sender delegate)) ERR_SELF_DELEGATION)
+        (asserts! (is-none (map-get? patient-delegates delegate-key)) ERR_DELEGATE_EXISTS)
+        
+        (map-set patient-delegates delegate-key {
+            granted-at: stacks-block-height,
+            can-grant: can-grant,
+            can-revoke: can-revoke,
+            active: true
+        })
+        
+        (map-set delegate-patients delegate (unwrap-panic (as-max-len? (append existing-patients tx-sender) u20)))
+        (ok true)
+    )
+)
+
+(define-public (remove-delegate (delegate principal))
+    (let
+        (
+            (delegate-key {patient: tx-sender, delegate: delegate})
+        )
+        (asserts! (is-some (map-get? patients tx-sender)) ERR_UNAUTHORIZED)
+        (match (map-get? patient-delegates delegate-key)
+            delegate-data
+            (begin
+                (map-set patient-delegates delegate-key (merge delegate-data {active: false}))
+                (ok true)
+            )
+            ERR_NOT_FOUND
+        )
+    )
+)
+
+(define-public (update-delegate-permissions (delegate principal) (can-grant bool) (can-revoke bool))
+    (let
+        (
+            (delegate-key {patient: tx-sender, delegate: delegate})
+        )
+        (asserts! (is-some (map-get? patients tx-sender)) ERR_UNAUTHORIZED)
+        (match (map-get? patient-delegates delegate-key)
+            delegate-data
+            (begin
+                (asserts! (get active delegate-data) ERR_NOT_DELEGATE)
+                (map-set patient-delegates delegate-key (merge delegate-data {can-grant: can-grant, can-revoke: can-revoke}))
+                (ok true)
+            )
+            ERR_NOT_FOUND
+        )
+    )
+)
+
+(define-public (grant-consent-as-delegate (patient principal) (provider principal) (record-type (optional (string-ascii 30))) (expires-at (optional uint)))
+    (let
+        (
+            (delegate-key {patient: patient, delegate: tx-sender})
+            (consent-id (var-get next-consent-id))
+            (consent-key {patient: patient, provider: provider})
+            (existing-consents (default-to (list) (map-get? patient-consents consent-key)))
+        )
+        (match (map-get? patient-delegates delegate-key)
+            delegate-data
+            (begin
+                (asserts! (get active delegate-data) ERR_NOT_DELEGATE)
+                (asserts! (get can-grant delegate-data) ERR_UNAUTHORIZED)
+                (asserts! (is-some (map-get? healthcare-providers provider)) ERR_NOT_FOUND)
+                
+                (unwrap! (match (map-get? healthcare-providers provider)
+                    provider-data
+                    (begin
+                        (asserts! (get verified provider-data) ERR_UNAUTHORIZED)
+                        (ok true)
+                    )
+                    ERR_NOT_FOUND
+                ) ERR_NOT_FOUND)
+                
+                (map-set consent-permissions consent-id {
+                    patient: patient,
+                    provider: provider,
+                    record-type: record-type,
+                    granted-at: stacks-block-height,
+                    expires-at: expires-at,
+                    active: true
+                })
+                
+                (map-set patient-consents consent-key (unwrap-panic (as-max-len? (append existing-consents consent-id) u50)))
+                
+                (let
+                    (
+                        (provider-patient-list (default-to (list) (map-get? provider-patients provider)))
+                    )
+                    (if (is-none (index-of provider-patient-list patient))
+                        (map-set provider-patients provider (unwrap-panic (as-max-len? (append provider-patient-list patient) u100)))
+                        true
+                    )
+                )
+                
+                (var-set next-consent-id (+ consent-id u1))
+                (ok consent-id)
+            )
+            ERR_NOT_DELEGATE
+        )
+    )
+)
+
+(define-public (revoke-consent-as-delegate (patient principal) (consent-id uint))
+    (let
+        (
+            (delegate-key {patient: patient, delegate: tx-sender})
+        )
+        (match (map-get? patient-delegates delegate-key)
+            delegate-data
+            (begin
+                (asserts! (get active delegate-data) ERR_NOT_DELEGATE)
+                (asserts! (get can-revoke delegate-data) ERR_UNAUTHORIZED)
+                
+                (match (map-get? consent-permissions consent-id)
+                    consent-data
+                    (begin
+                        (asserts! (is-eq (get patient consent-data) patient) ERR_UNAUTHORIZED)
+                        (map-set consent-permissions consent-id (merge consent-data {active: false}))
+                        (ok true)
+                    )
+                    ERR_NOT_FOUND
+                )
+            )
+            ERR_NOT_DELEGATE
+        )
+    )
+)
+
 (define-private (is-emergency-active (patient principal) (provider principal))
     (get found (fold check-emergency-match (generate-emergency-ids) {patient: patient, provider: provider, found: false}))
 )
@@ -607,6 +761,35 @@
             (consent-ids (default-to (list) (map-get? patient-consents consent-key)))
         )
         (get ids (fold build-expiring-consent-list consent-ids {window: window, now: stacks-block-height, ids: (list)}))
+    )
+)
+
+(define-read-only (get-delegate-info (patient principal) (delegate principal))
+    (map-get? patient-delegates {patient: patient, delegate: delegate})
+)
+
+(define-read-only (get-delegate-patients (delegate principal))
+    (map-get? delegate-patients delegate)
+)
+
+(define-read-only (is-active-delegate (patient principal) (delegate principal))
+    (match (map-get? patient-delegates {patient: patient, delegate: delegate})
+        delegate-data (get active delegate-data)
+        false
+    )
+)
+
+(define-read-only (can-delegate-grant (patient principal) (delegate principal))
+    (match (map-get? patient-delegates {patient: patient, delegate: delegate})
+        delegate-data (and (get active delegate-data) (get can-grant delegate-data))
+        false
+    )
+)
+
+(define-read-only (can-delegate-revoke (patient principal) (delegate principal))
+    (match (map-get? patient-delegates {patient: patient, delegate: delegate})
+        delegate-data (and (get active delegate-data) (get can-revoke delegate-data))
+        false
     )
 )
 
