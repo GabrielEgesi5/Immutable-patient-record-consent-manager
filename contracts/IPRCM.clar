@@ -15,12 +15,14 @@
 (define-constant ERR_NOT_DELEGATE (err u108))
 (define-constant ERR_DELEGATE_EXISTS (err u109))
 (define-constant ERR_SELF_DELEGATION (err u110))
+(define-constant ERR_NO_ACCESS (err u111))
 (define-constant MAX_EMERGENCY_WINDOW u720)
 
 (define-data-var next-record-id uint u1)
 (define-data-var next-consent-id uint u1)
 (define-data-var next-emergency-id uint u1)
 (define-data-var next-template-id uint u1)
+(define-data-var next-audit-id uint u1)
 
 (define-map patients
     principal
@@ -122,6 +124,27 @@
 (define-map delegate-patients
     principal
     (list 20 principal)
+)
+
+(define-map audit-trail
+    uint
+    {
+        patient: principal,
+        provider: principal,
+        record-id: uint,
+        action: (string-ascii 20),
+        logged-at: uint
+    }
+)
+
+(define-map patient-audit-logs
+    principal
+    (list 200 uint)
+)
+
+(define-map provider-audit-logs
+    principal
+    (list 200 uint)
 )
 
 (define-public (register-patient (name (string-ascii 50)))
@@ -793,12 +816,55 @@
     )
 )
 
+(define-public (log-record-access (patient principal) (record-id uint) (action (string-ascii 20)))
+    (let
+        (
+            (audit-id (var-get next-audit-id))
+            (record-data (unwrap! (map-get? patient-records record-id) ERR_NOT_FOUND))
+            (existing-patient-logs (default-to (list) (map-get? patient-audit-logs patient)))
+            (existing-provider-logs (default-to (list) (map-get? provider-audit-logs tx-sender)))
+        )
+        (asserts! (is-some (map-get? healthcare-providers tx-sender)) ERR_UNAUTHORIZED)
+        (asserts! (is-some (map-get? patients patient)) ERR_NOT_FOUND)
+        (asserts! (is-eq (get patient record-data) patient) ERR_UNAUTHORIZED)
+        (asserts! (>= (len action) u1) ERR_INVALID_INPUT)
+        (asserts! (has-access patient tx-sender none) ERR_NO_ACCESS)
+
+        (map-set audit-trail audit-id {
+            patient: patient,
+            provider: tx-sender,
+            record-id: record-id,
+            action: action,
+            logged-at: stacks-block-height
+        })
+
+        (map-set patient-audit-logs patient (unwrap-panic (as-max-len? (append existing-patient-logs audit-id) u200)))
+        (map-set provider-audit-logs tx-sender (unwrap-panic (as-max-len? (append existing-provider-logs audit-id) u200)))
+        (var-set next-audit-id (+ audit-id u1))
+
+        (ok audit-id)
+    )
+)
+
+(define-read-only (get-audit-entry (audit-id uint))
+    (map-get? audit-trail audit-id)
+)
+
+(define-read-only (get-patient-audit-log (patient principal))
+    (map-get? patient-audit-logs patient)
+)
+
+(define-read-only (get-provider-audit-log (provider principal))
+    (map-get? provider-audit-logs provider)
+)
+
 (define-read-only (get-contract-info)
     {
         next-record-id: (var-get next-record-id),
         next-consent-id: (var-get next-consent-id),
         next-emergency-id: (var-get next-emergency-id),
         next-template-id: (var-get next-template-id),
+        next-audit-id: (var-get next-audit-id),
         contract-owner: CONTRACT_OWNER
     }
 )
